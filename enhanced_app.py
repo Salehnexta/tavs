@@ -8,10 +8,12 @@ import os
 import sys
 import logging
 import datetime
+import json
 from typing import List, Dict, Any, Tuple, Optional
 
 import streamlit as st
 from dotenv import load_dotenv
+from google.adk.runners import Runner, InMemorySessionService, InvocationContext
 
 # Add the current directory to PATH for imports
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -20,6 +22,21 @@ if current_dir not in sys.path:
 
 # Import our working travel agent
 from working_agent.agent import root_agent
+
+# Set up session service for ADK
+session_service = InMemorySessionService()
+
+# Define constants for identifying the interaction context
+APP_NAME = "travel_assistant_app"
+
+# Create a runner for the agent
+travel_runner = Runner(
+    agent=root_agent,
+    app_name=APP_NAME,
+    session_service=session_service
+)
+
+print(f"Runner created for agent '{root_agent.name}'")
 
 # Load environment variables
 load_dotenv()
@@ -361,14 +378,113 @@ def process_user_message(user_input: str) -> None:
         message_placeholder.markdown("Thinking...")
     
     try:
-        # Create an invocation context for the agent
-        invocation_id = f"streamlit-session-{id(st.session_state)}"
+        # Get or create a unique session ID for this Streamlit session
+        if "session_id" not in st.session_state:
+            st.session_state.session_id = f"session_{id(st.session_state)}"
+            
+        # Get or create a unique user ID for this user
+        if "user_id" not in st.session_state:
+            st.session_state.user_id = f"user_{id(st.session_state)}"
         
-        # Handle user message with the root agent
-        response = root_agent.handle_message(user_input, conversation_id=invocation_id)
+        # Create an invocation context
+        invocation_context = InvocationContext()
         
-        # Format the response
-        formatted_response = format_agent_response(response)
+        # Use the runner to run the agent
+        runner_response = travel_runner.run(
+            user_message=user_input,
+            user_id=st.session_state.user_id,
+            session_id=st.session_state.session_id,
+            invocation_context=invocation_context
+        )
+        
+        # Extract the text response
+        response_text = ""
+        if runner_response and hasattr(runner_response, "message") and runner_response.message:
+            response_text = runner_response.message.content
+        elif isinstance(runner_response, dict) and "content" in runner_response:
+            response_text = runner_response["content"]
+        else:
+            response_text = "I apologize, but I'm having trouble processing your request."
+        
+        # Get any tool outputs
+        tool_outputs = []
+        if hasattr(runner_response, "tool_outputs") and runner_response.tool_outputs:
+            tool_outputs = runner_response.tool_outputs
+        
+        # Extract the response content - handle various possible response formats
+        response_content = ""
+        if isinstance(response, dict) and "content" in response:
+            response_content = response["content"]
+        elif hasattr(response, "message") and hasattr(response.message, "content"):
+            response_content = response.message.content
+        elif isinstance(response, str):
+            response_content = response
+        else:
+            response_content = "I'm sorry, I couldn't generate a response in the expected format."
+        
+        # Initialize tool result variables
+        flight_results = None
+        hotel_results = None
+        travel_info = None
+        search_results = None
+        
+        # Try to extract tool outputs from the response
+        tool_outputs = []
+        
+        # Check if response has tool_outputs attribute
+        if hasattr(response, 'tool_outputs') and response.tool_outputs:
+            tool_outputs = response.tool_outputs
+        # Check if response is a dict with tool_outputs key
+        elif isinstance(response, dict) and 'tool_outputs' in response:
+            tool_outputs = response['tool_outputs']
+            
+            # Process tool outputs
+            for tool_output in tool_outputs:
+                if tool_output.tool_name == "flight_search" or tool_output.tool_name == "real_flight_search":
+                    try:
+                        flight_data = tool_output.data
+                        if isinstance(flight_data, dict) and 'flights' in flight_data:
+                            flight_results = flight_data.get('flights', [])
+                    except Exception as e:
+                        logger.error(f"Error processing flight results: {e}")
+                
+                elif tool_output.tool_name == "hotel_search":
+                    try:
+                        hotel_data = tool_output.data
+                        if isinstance(hotel_data, dict) and 'hotels' in hotel_data:
+                            hotel_results = hotel_data.get('hotels', [])
+                    except Exception as e:
+                        logger.error(f"Error processing hotel results: {e}")
+                
+                elif tool_output.tool_name == "travel_info":
+                    try:
+                        travel_info = tool_output.data
+                    except Exception as e:
+                        logger.error(f"Error processing travel info: {e}")
+                
+                elif tool_output.tool_name == "web_search":
+                    try:
+                        search_data = tool_output.data
+                        if isinstance(search_data, dict) and 'results' in search_data:
+                            search_results = search_data.get('results', [])
+                    except Exception as e:
+                        logger.error(f"Error processing search results: {e}")
+        
+        # Format the response with any tool outputs
+        formatted_response = f"<div class='agent-response'>{response_content}</div>"
+        
+        # Add any formatted tool outputs
+        if flight_results:
+            formatted_response += format_flight_results(flight_results)
+        
+        if hotel_results:
+            formatted_response += format_hotel_results(hotel_results)
+        
+        if travel_info:
+            formatted_response += format_travel_info(travel_info)
+        
+        if search_results:
+            formatted_response += format_search_results(search_results)
         
         # Update the placeholder with the formatted response
         message_placeholder.markdown(formatted_response, unsafe_allow_html=True)
